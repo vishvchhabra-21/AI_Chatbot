@@ -145,7 +145,7 @@ wss.on("connection", (ws) => {
     if (session.stage === "awaiting_url") {
       session.stage = "crawling";
       session.seedUrl = text;
-      send(ws, { type: "status", text: "Crawling website (up to 2 links deep)..." });
+      send(ws, { type: "status", text: `Crawling website (up to ${env.CRAWL_MAX_PAGES} pages)...` });
 
       try {
         const result = await crawlWebsite(text);

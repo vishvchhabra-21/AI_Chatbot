@@ -58,7 +58,8 @@ const EnvSchema = z.object({
   OLLAMA_BASE_URL: z.string().default("http://localhost:11434"),
   OLLAMA_MODEL: z.string().default("qwen2.5-coder:7b"),
 
-  CRAWL_MAX_PAGES: z.coerce.number().int().positive().default(60),
+  CRAWL_MAX_DEPTH: z.coerce.number().int().positive().default(3),
+  CRAWL_MAX_PAGES: z.coerce.number().int().positive().default(100),
   CRAWL_TIMEOUT_MS: z.coerce.number().int().positive().default(12000),
   CRAWL_CONCURRENCY: z.coerce.number().int().positive().default(4)
 });

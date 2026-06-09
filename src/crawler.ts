@@ -37,6 +37,21 @@ function normalizeUrl(raw: string): string | null {
   try {
     const u = new URL(raw);
     u.hash = "";
+    const dropParams = new Set([
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "utm_id",
+      "gclid",
+      "fbclid",
+      "mc_cid",
+      "mc_eid"
+    ]);
+    for (const key of Array.from(u.searchParams.keys())) {
+      if (dropParams.has(key.toLowerCase())) u.searchParams.delete(key);
+    }
     return u.toString();
   } catch {
     return null;
@@ -54,12 +69,19 @@ function isCrawlableLink(href: string): boolean {
   if (trimmed.startsWith("mailto:")) return false;
   if (trimmed.startsWith("tel:")) return false;
   if (trimmed.startsWith("javascript:")) return false;
+  if (/\.(pdf|png|jpe?g|gif|webp|svg|ico|zip|rar|7z|gz|tgz|mp4|mov|avi|mp3|wav|m4a|woff2?|ttf|eot)(\?|#|$)/i.test(trimmed)) return false;
   return true;
 }
 
 function pushIfMeaningful(target: string[], value: string | null | undefined, minLength = 10): void {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (text && text.length >= minLength) target.push(text);
+}
+
+function truncateText(text: string, maxLength = 4000): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, maxLength)}...`;
 }
 
 function collectMetadataText($: cheerio.CheerioAPI): string[] {
@@ -356,6 +378,68 @@ function collectJsonLdText($: cheerio.CheerioAPI): string[] {
   return values;
 }
 
+function collectEmbeddedJsonText($: cheerio.CheerioAPI): string[] {
+  const values: string[] = [];
+  const seen = new Set<string>();
+
+  const collectFrom = (raw: string): void => {
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    const stack: Array<{ value: unknown; depth: number }> = [{ value: data, depth: 0 }];
+    const maxDepth = 7;
+    const maxItems = 240;
+
+    while (stack.length > 0 && values.length < maxItems) {
+      const next = stack.pop();
+      if (!next) break;
+      const { value, depth } = next;
+      if (depth > maxDepth) continue;
+
+      if (typeof value === "string") {
+        const trimmed = value.replace(/\s+/g, " ").trim();
+        if (trimmed.length < 30) continue;
+        if (isLikelyUrl(trimmed)) continue;
+        const key = trimmed.slice(0, 160).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        values.push(truncateText(trimmed, 600));
+        continue;
+      }
+
+      if (Array.isArray(value)) {
+        for (let i = value.length - 1; i >= 0; i--) stack.push({ value: value[i], depth: depth + 1 });
+        continue;
+      }
+
+      if (value && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        for (const [k, v] of Object.entries(record)) {
+          if (/^(href|src|icon|logo|image|images|thumbnail|url|urls|path|slug|id)$/i.test(k)) continue;
+          stack.push({ value: v, depth: depth + 1 });
+        }
+      }
+    }
+  };
+
+  $("script").each((_, el) => {
+    const id = String($(el).attr("id") ?? "");
+    const type = String($(el).attr("type") ?? "");
+    if (id === "__NEXT_DATA__" || type === "application/json") {
+      const raw = $(el).html();
+      if (!raw) return;
+      if (raw.length > 3_000_000) return;
+      collectFrom(raw);
+    }
+  });
+
+  return values;
+}
+
 function extractTextAndLinks(html: string, baseUrl: string): { title: string | null; text: string; links: string[] } {
   const $ = cheerio.load(html);
   const title = $("title").first().text().trim() || null;
@@ -379,7 +463,7 @@ function extractTextAndLinks(html: string, baseUrl: string): { title: string | n
 
   for (const { selector, minLength } of semanticSelectors) {
     $(selector).each((_, el) => {
-      const t = $(el).text().replace(/\s+/g, " ").trim();
+      const t = truncateText($(el).text(), 5000);
       if (t && t.length >= minLength) chunks.push(t);
     });
   }
@@ -392,6 +476,11 @@ function extractTextAndLinks(html: string, baseUrl: string): { title: string | n
   // Phase 3: Collect ALL JSON-LD structured data
   for (const value of collectJsonLdText($)) {
     pushIfMeaningful(chunks, value, 3);
+  }
+
+  // Phase 3.5: Extract from embedded application JSON (Next.js and similar apps)
+  for (const value of collectEmbeddedJsonText($)) {
+    pushIfMeaningful(chunks, value, 10);
   }
 
   // Phase 4: If we still have little content, extract from broader body text
@@ -408,7 +497,7 @@ function extractTextAndLinks(html: string, baseUrl: string): { title: string | n
     
     for (const sel of bodySelectors) {
       $(sel).each((_, el) => {
-        const t = $(el).text().replace(/\s+/g, " ").trim();
+        const t = truncateText($(el).text(), 6000);
         if (t && t.length >= 30 && !chunks.some(c => c.includes(t.substring(0, 50)))) {
           chunks.push(t);
         }
@@ -429,8 +518,15 @@ function extractTextAndLinks(html: string, baseUrl: string): { title: string | n
   }
 
   // Remove duplicates and join
-  const uniqueChunks = Array.from(new Set(chunks.map(c => c.substring(0, 300)))); // Deduplicate by first 300 chars
-  const text = uniqueChunks.join("\n");
+  const uniqueByPrefix = new Map<string, string>();
+  for (const chunk of chunks) {
+    const normalized = chunk.replace(/\s+/g, " ").trim();
+    if (!normalized) continue;
+    const key = normalized.slice(0, 260).toLowerCase();
+    const existing = uniqueByPrefix.get(key);
+    if (!existing || normalized.length > existing.length) uniqueByPrefix.set(key, normalized);
+  }
+  const text = Array.from(uniqueByPrefix.values()).join("\n");
 
   // #region debug-point A:extract-summary
   reportDebug("A", "src/crawler.ts:extractTextAndLinks", "Extracted page summary", {
@@ -481,7 +577,7 @@ async function fetchHtml(url: string, timeoutMs: number): Promise<string | null>
     // #endregion
     if (!res.ok) return null;
     const contentType = res.headers.get("content-type") ?? "";
-    if (!contentType.includes("text/html")) return null;
+    if (contentType && !/html|xhtml/i.test(contentType)) return null;
     return await res.text();
   } catch {
     // #region debug-point B:fetch-failure
@@ -489,6 +585,97 @@ async function fetchHtml(url: string, timeoutMs: number): Promise<string | null>
     // #endregion
     return null;
   }
+}
+
+async function fetchText(url: string, timeoutMs: number): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "WebsiteChatbot/0.1 (+https://localhost)"
+      }
+    });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+function extractSitemapLocs(xml: string): string[] {
+  const out: string[] = [];
+  const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml))) {
+    const raw = m[1]?.trim();
+    if (raw) out.push(raw);
+    if (out.length >= 1200) break;
+  }
+  return out;
+}
+
+async function discoverSitemapUrls(seed: URL, timeoutMs: number): Promise<string[]> {
+  const candidates = new Set<string>([
+    new URL("/sitemap.xml", seed).toString(),
+    new URL("/sitemap_index.xml", seed).toString()
+  ]);
+
+  const robots = await fetchText(new URL("/robots.txt", seed).toString(), timeoutMs);
+  if (robots) {
+    const re = /^sitemap:\s*(\S+)\s*$/gim;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(robots))) {
+      if (m[1]) candidates.add(m[1].trim());
+      if (candidates.size >= 6) break;
+    }
+  }
+
+  const urls = new Set<string>();
+  const seenSitemaps = new Set<string>();
+
+  const processSitemap = async (sitemapUrl: string): Promise<void> => {
+    if (seenSitemaps.has(sitemapUrl)) return;
+    seenSitemaps.add(sitemapUrl);
+
+    const xml = await fetchText(sitemapUrl, timeoutMs);
+    if (!xml) return;
+
+    const locs = extractSitemapLocs(xml);
+    const isIndex = /<sitemapindex/i.test(xml);
+    if (isIndex) {
+      for (const loc of locs.slice(0, 10)) {
+        const normalized = normalizeUrl(loc);
+        if (!normalized) continue;
+        await processSitemap(normalized);
+      }
+      return;
+    }
+
+    for (const loc of locs) {
+      const normalized = normalizeUrl(loc);
+      if (!normalized) continue;
+      try {
+        const u = new URL(normalized);
+        if (!sameOrigin(seed, u)) continue;
+      } catch {
+        continue;
+      }
+      urls.add(normalized);
+      if (urls.size >= 500) break;
+    }
+  };
+
+  for (const sitemapUrl of Array.from(candidates)) {
+    const normalized = normalizeUrl(sitemapUrl);
+    if (!normalized) continue;
+    await processSitemap(normalized);
+    if (urls.size >= 200) break;
+  }
+
+  return Array.from(urls);
 }
 
 async function workerLoop(
@@ -546,7 +733,12 @@ async function workerLoop(
     if (next.depth < opts.maxDepth) {
       for (const link of links) {
         if (pages.length >= opts.maxPages) break;
-        if (!visited.has(link)) queue.push({ url: link, depth: next.depth + 1 });
+        const normalizedLink = normalizeUrl(link);
+        if (!normalizedLink) continue;
+        if (/\/(cdn-cgi|wp-admin|wp-login)\b/i.test(normalizedLink)) continue;
+        if (!visited.has(normalizedLink) && queue.length < opts.maxPages * 20) {
+          queue.push({ url: normalizedLink, depth: next.depth + 1 });
+        }
       }
     }
   }
@@ -558,13 +750,26 @@ export async function crawlWebsite(seedUrl: string): Promise<{ seed: string; pag
 
   const origin = new URL(normalizedSeed);
   const opts: CrawlOptions = {
-    maxDepth: 2,
+    maxDepth: env.CRAWL_MAX_DEPTH,
     maxPages: env.CRAWL_MAX_PAGES,
     concurrency: env.CRAWL_CONCURRENCY,
     timeoutMs: env.CRAWL_TIMEOUT_MS
   };
 
   const queue: Array<{ url: string; depth: number }> = [{ url: normalizedSeed, depth: 0 }];
+  const commonPaths = ["/about", "/about-us", "/contact", "/pricing", "/services", "/products", "/blog", "/docs"];
+  for (const p of commonPaths) {
+    try {
+      queue.push({ url: new URL(p, origin).toString(), depth: 1 });
+    } catch {
+      // ignore
+    }
+  }
+
+  const sitemapUrls = await discoverSitemapUrls(origin, opts.timeoutMs);
+  for (const url of sitemapUrls.slice(0, Math.min(200, opts.maxPages * 4))) {
+    queue.push({ url, depth: 1 });
+  }
   const visited = new Set<string>();
   const pages: CrawledPage[] = [];
 

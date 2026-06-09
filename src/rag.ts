@@ -133,9 +133,9 @@ function retrieveBm25(kb: KnowledgeBase, query: string, k = 6): Document[] {
 }
 
 function retrieveDocs(kb: KnowledgeBase, question: string): Document[] {
-  const hits = retrieveBm25(kb, question, 6);
-  if (hits.length > 0) return hits;
-  return kb.docs.slice(0, Math.min(3, kb.docs.length));
+  const hits = retrieveBm25(kb, question, 10);
+  if (hits.length > 0) return hits.slice(0, 8);
+  return kb.docs.slice(0, Math.min(5, kb.docs.length));
 }
 
 function splitIntoSentences(text: string): string[] {
