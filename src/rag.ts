@@ -124,6 +124,7 @@ function retrieveBm25(kb: KnowledgeBase, query: string, k = 6): Document[] {
     }
   }
 
+  
   return scores
     .map((score, idx) => ({ score, idx }))
     .filter((x) => x.score > 0)
