@@ -42,6 +42,7 @@ GROQ - your-groq-key
 
 If you also use Ollama locally, the app uses the default local Ollama settings in the code.
 
+
 Important:
 
 - Keep the file in the project root.
